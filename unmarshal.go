@@ -2,18 +2,62 @@ package njson
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"reflect"
 	"strings"
 
+	"github.com/pingcap/errors"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 const (
-	njsonTag = "njson"
-	jsonTag  = "json"
+	N_JSON_TAG = "njson"
 )
+
+type NjsonTag struct {
+	Fullname   string
+	Format     string
+	FormatPath string
+}
+
+func NewNjsonTag(njsonTag string) (nTag *NjsonTag) {
+	nTag = &NjsonTag{}
+	if !strings.Contains(njsonTag, ";") {
+		nTag.Fullname = njsonTag
+		return
+	}
+
+	strArr := strings.Split(njsonTag, ";")
+	for _, str := range strArr {
+		kvArr := strings.Split(str, ":")
+		if len(kvArr) != 2 {
+			err := errors.Errorf("invalid tag: %s", str)
+			panic(err)
+		}
+		k := strings.Trim(kvArr[0], " ")
+		v := strings.Trim(kvArr[1], " ")
+		rv := reflect.Indirect(reflect.ValueOf(nTag))
+		rt := rv.Type()
+		k = strings.ToUpper(k[0:1]) + k[1:]
+		_, ok := rt.FieldByName(k)
+		if !ok {
+			err := errors.Errorf("invalid tag unsupport field: %s", k)
+			panic(err)
+		}
+		rfv := rv.FieldByName(k)
+		if !rfv.CanSet() {
+			err := errors.Errorf("filed %s unsuport set: in %#v", k, nTag)
+			panic(err)
+		}
+		rfv.Set(reflect.ValueOf(v))
+	}
+	if nTag.Format != "" && nTag.FormatPath == "" { // 设置了各式化方式，没有设置格式化路径时，使用fullnae作为格式化路径
+		nTag.FormatPath = nTag.Fullname
+	}
+
+	return
+}
 
 var jsonNumberType = reflect.TypeOf(json.Number(""))
 
@@ -43,32 +87,59 @@ func Unmarshal(data []byte, v interface{}) (err error) {
 	}
 	elem := rv.Elem()
 	typeOfT := elem.Type()
+	formatArr := make(map[string]*NjsonTag)
 	for i := 0; i < elem.NumField(); i++ {
 		field := elem.Field(i)
-
-		// Check that the tag is either "json" or "njson", and can be set
-		if (!validTag(typeOfT.Field(i), njsonTag) && !validTag(typeOfT.Field(i), jsonTag)) || !field.CanSet() {
+		// Check that the tag is  "njson", and can be set
+		if (!validTag(typeOfT.Field(i), N_JSON_TAG)) || !field.CanSet() {
 			continue
 		}
 
 		// Assume "njson" by default, but change to "json" if tag matches
-		fieldName := typeOfT.Field(i).Tag.Get(njsonTag)
-		if validTag(typeOfT.Field(i), jsonTag) {
-			fieldName = typeOfT.Field(i).Tag.Get(jsonTag)
+		tag := typeOfT.Field(i).Tag.Get(N_JSON_TAG)
+		njsonTag := NewNjsonTag(tag)
+		if njsonTag.Format != "" {
+			formatArr[njsonTag.FormatPath] = njsonTag
+		}
+	}
+	//先处理需要format的字段
+	for _, njsonTag := range formatArr {
+		fragment := gjson.GetBytes(data, njsonTag.FormatPath)
+		formatHandler, ok := formatHandlerMap[njsonTag.Format]
+		if !ok {
+			err := errors.Errorf("format: %s unsupport!!", njsonTag.Format)
+			panic(err)
+		}
+		newJson := fmt.Sprintf(`{"%s":"%s"}`, njsonTag.FormatPath, fragment.String())
+		newFragmentStr, err := formatHandler(newJson)
+		if err != nil {
+			return err
+		}
+		data, err = sjson.SetBytes(data, njsonTag.FormatPath, newFragmentStr)
+		if err != nil {
+			return err
+		}
+	}
 
-			// Only support true "json" tags:
-			// if a tag is nested, it must use the "njson" tag
-			if len(strings.Split(fieldName, ".")) > 1 {
-				return fmt.Errorf("invalid json tag: %s", fieldName)
-			}
+	for i := 0; i < elem.NumField(); i++ {
+		field := elem.Field(i)
+		fieldType := typeOfT.Field(i)
+
+		// Check that the tag is  "njson", and can be set
+		if (!validTag(typeOfT.Field(i), N_JSON_TAG)) || !field.CanSet() {
+			continue
 		}
 
+		// Assume "njson" by default, but change to "json" if tag matches
+		tagStr := typeOfT.Field(i).Tag.Get(N_JSON_TAG)
+		njsonTag := NewNjsonTag(tagStr)
+
 		// get field value by tag
-		result := gjson.GetBytes(data, fieldName)
+		result := gjson.GetBytes(data, njsonTag.Fullname)
 
 		// if field type json.Number
 		if v != nil && field.Kind() == reflect.String && field.Type() == jsonNumberType {
-			elem.Field(i).SetString(result.String())
+			SetValue(v, elem, field, fieldType, result.String(), reflect.String)
 			continue
 		}
 
@@ -81,10 +152,61 @@ func Unmarshal(data []byte, v interface{}) (err error) {
 		}
 
 		if v != nil {
-			elem.Field(i).Set(reflect.ValueOf(value))
+			SetValue(v, elem, field, fieldType, value, reflect.Interface)
 		}
 	}
 
+	return
+}
+
+func SetValue(dst interface{}, elem reflect.Value, field reflect.Value, fieldType reflect.StructField, result interface{}, reflectType reflect.Kind) (err error) {
+	vt := reflect.TypeOf(dst)
+	fieldName := fieldType.Name
+	setFuncName := fmt.Sprintf("%s%s", "Set", fieldName)
+	var args []reflect.Value
+	var valStr string
+	args = append(args, reflect.ValueOf(dst))
+	refMethod, refMehtodOk := vt.MethodByName(setFuncName)
+	if reflectType == reflect.String {
+		valStr, _ = result.(string)
+		args = append(args, reflect.ValueOf(valStr))
+	} else {
+		args = append(args, reflect.ValueOf(result))
+	}
+
+	if !refMehtodOk {
+		if reflectType == reflect.String {
+			field.SetString(valStr)
+		} else {
+			field.Set(reflect.ValueOf(result))
+		}
+		return
+	}
+	err = CallSetMethod(refMethod, args)
+	if err != nil {
+		return
+	}
+	return
+}
+
+func CallSetMethod(refMethod reflect.Method, args []reflect.Value) (err error) {
+	setFuncName := refMethod.Name
+	refOutArr := refMethod.Func.Call(args)
+	refOutLen := len(refOutArr)
+	switch refOutLen {
+	case 0:
+	case 1:
+		refOut := refOutArr[0]
+		if err, ok := refOut.Interface().(error); ok {
+			if err != nil {
+				return err
+			} else {
+				panic(fmt.Sprintf("%s return value type except error ,got %#v", setFuncName, refOut.Interface()))
+			}
+		}
+	default:
+		panic(fmt.Sprintf("%s expect 0 or 1 return value ,got %d", setFuncName, refOutLen))
+	}
 	return
 }
 
@@ -129,4 +251,28 @@ func unmarshalStruct(raw string, field reflect.Type) interface{} {
 	}
 
 	return reflect.Indirect(reflect.ValueOf(v)).Interface()
+}
+
+var formatHandlerMap = map[string]func(input string) (out interface{}, err error){
+	"json": func(input string) (out interface{}, err error) {
+		var v map[string]string
+		err = json.Unmarshal([]byte(input), &v)
+		if err != nil {
+			return
+		}
+		var name string
+		for name = range v {
+			break
+		}
+		out = new(interface{})
+		err = json.Unmarshal([]byte(v[name]), &out)
+		if err != nil {
+			return
+		}
+		return
+	},
+	"comma": func(input string) (out interface{}, err error) {
+		out = strings.Split(input, ",")
+		return
+	},
 }
