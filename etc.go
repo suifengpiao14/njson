@@ -5,9 +5,8 @@ import (
 	"strings"
 )
 
-func validTag(filed reflect.StructField, tag string) bool {
-	return !(filed.Tag.Get(tag) == "" ||
-		filed.Tag.Get(tag) == "-")
+func validTag(tag string) bool {
+	return !(tag == "" || tag == "-")
 }
 
 func isStructureType(typ string) (ok bool) {
